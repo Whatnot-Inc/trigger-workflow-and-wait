@@ -13,6 +13,7 @@ usage_docs() {
 }
 GITHUB_API_URL="${API_URL:-https://api.github.com}"
 GITHUB_SERVER_URL="${SERVER_URL:-https://github.com}"
+NOT_FOUND_RETRIES=0
 
 validate_args() {
   wait_interval=10 # Waits for 10 seconds
@@ -103,6 +104,10 @@ api() {
     echo >&2 "response: $response"
     if [[ "$response" == *'"Server Error"'* ]]; then 
       echo "Server error - trying again"
+    elif [ $NOT_FOUND_RETRIES -lt 3 ] && [[ "$response" == *'"Not Found"'* ]]; then
+      echo "$response"
+      NOT_FOUND_RETRIES=$((NOT_FOUND_RETRIES + 1))
+      echo >&2 "Not found (attempt $NOT_FOUND_RETRIES) - trying again"
     else
       exit 1
     fi
