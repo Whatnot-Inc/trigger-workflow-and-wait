@@ -143,9 +143,20 @@ trigger_workflow() {
   echo >&2 "  workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches"
   echo >&2 "  {\"ref\":\"${ref}\",\"inputs\":${client_payload}}"
 
-  api "workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches" \
-    --data "{\"ref\":\"${ref}\",\"inputs\":${client_payload}}"
+  dispatch_response=$(api "workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches" \
+    --data "{\"ref\":\"${ref}\",\"inputs\":${client_payload}}")
 
+  # Check if the response contains workflow_run_id (new GitHub API behavior)
+  workflow_run_id=$(echo "$dispatch_response" | jq -r '.workflow_run_id // empty')
+
+  if [ -n "$workflow_run_id" ]; then
+    echo >&2 "Workflow run ID returned directly: $workflow_run_id"
+    echo "$workflow_run_id"
+    return
+  fi
+
+  # Fall back to polling approach (old behavior)
+  echo >&2 "No workflow_run_id in response, falling back to polling"
   NEW_RUNS=$OLD_RUNS
   while [ "$NEW_RUNS" = "$OLD_RUNS" ]
   do
