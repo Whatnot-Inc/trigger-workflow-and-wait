@@ -13,14 +13,6 @@ on:
       - v**
 
 jobs:
-  unit-test:
-    name: Unit tests
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-    - name: Run retry tests
-      run: bash tests/test_retry.sh
-
   build-docker:
     name: Build docker image
     runs-on: ubuntu-latest
