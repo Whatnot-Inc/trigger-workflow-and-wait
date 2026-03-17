@@ -84,12 +84,14 @@ validate_args() {
 }
 
 lets_wait() {
-  echo "Sleeping for ${wait_interval} seconds"
-  sleep "$wait_interval"
+  local interval=${1:-$wait_interval}
+  echo >&2 "Sleeping for $interval seconds"
+  sleep "$interval"
 }
 
 api() {
   path=$1; shift
+  local curl_exit_code
   if response=$(curl --fail-with-body -sSL \
       "${GITHUB_API_URL}/repos/${INPUT_OWNER}/${INPUT_REPO}/actions/$path" \
       -H "Authorization: Bearer ${INPUT_GITHUB_TOKEN}" \
@@ -99,11 +101,18 @@ api() {
   then
     echo "$response"
   else
+    curl_exit_code=$?
     echo >&2 "api failed:"
     echo >&2 "path: $path"
     echo >&2 "response: $response"
-    if [[ "$response" == *'"Server Error"'* ]]; then 
-      echo "Server error - trying again"
+    # Retry on transient curl errors (DNS, connection, timeout)
+    # 6=DNS, 7=connection refused, 28=timeout, 35=SSL connect, 56=recv error
+    if [[ $curl_exit_code -eq 6 || $curl_exit_code -eq 7 || $curl_exit_code -eq 28 || $curl_exit_code -eq 35 || $curl_exit_code -eq 56 ]]; then
+      echo "{}"
+      echo >&2 "Transient network error (curl exit code $curl_exit_code) - trying again"
+    elif [[ "$response" == *'"Server Error"'* ]]; then
+      echo "{}"
+      echo >&2 "Server error - trying again"
     elif [ $NOT_FOUND_RETRIES -lt 3 ] && [[ "$response" == *'"Not Found"'* ]]; then
       echo "$response"
       NOT_FOUND_RETRIES=$((NOT_FOUND_RETRIES + 1))
@@ -114,11 +123,6 @@ api() {
   fi
 }
 
-lets_wait() {
-  local interval=${1:-$wait_interval}
-  echo >&2 "Sleeping for $interval seconds"
-  sleep "$interval"
-}
 
 # Return the ids of the most recent workflow runs, optionally filtered by user
 get_workflow_runs() {
