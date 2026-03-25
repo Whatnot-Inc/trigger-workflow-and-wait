@@ -101,7 +101,14 @@ api() {
     echo >&2 "api failed:"
     echo >&2 "path: $path"
     echo >&2 "response: $result"
-    if [ $NOT_FOUND_RETRIES -lt 3 ] && echo "$result" | grep -q "Not Found"; then
+    # gh api does not retry on transient network errors, so we handle them here
+    # by returning an empty JSON object and letting the caller's polling loop retry.
+    # gh formats DNS errors specially ("error connecting to <host>"), all other
+    # network errors use Go's url.Error format ('<Method> "<URL>": <inner error>').
+    if echo "$result" | grep -qiE "error connecting to|connection refused|connection timed out|operation timed out|context deadline exceeded|i/o timeout|TLS handshake timeout|connection reset by peer|broken pipe"; then
+      echo "{}"
+      echo >&2 "Transient network error - trying again"
+    elif [ $NOT_FOUND_RETRIES -lt 3 ] && echo "$result" | grep -q "Not Found"; then
       echo "{}"
       NOT_FOUND_RETRIES=$((NOT_FOUND_RETRIES + 1))
       echo >&2 "Not found (attempt $NOT_FOUND_RETRIES) - trying again"
