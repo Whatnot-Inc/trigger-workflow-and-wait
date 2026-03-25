@@ -49,10 +49,33 @@ inputs:
 outputs:
   workflow_id:
     description: The ID of the workflow that was triggered by this action
+    value: ${{ steps.trigger-and-wait.outputs.workflow_id }}
   workflow_url:
     description: The URL of the workflow that was triggered by this action
+    value: ${{ steps.trigger-and-wait.outputs.workflow_url }}
   conclusion:
     description: Conclusion of the job, i.e pass/failure
+    value: ${{ steps.trigger-and-wait.outputs.conclusion }}
 runs:
-  using: 'docker'
-  image: 'Dockerfile'
+  using: 'composite'
+  steps:
+    - name: Trigger and wait
+      id: trigger-and-wait
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        INPUT_OWNER: ${{ inputs.owner }}
+        INPUT_REPO: ${{ inputs.repo }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
+        INPUT_WORKFLOW_FILE_NAME: ${{ inputs.workflow_file_name }}
+        INPUT_CLIENT_PAYLOAD: ${{ inputs.client_payload }}
+        INPUT_REF: ${{ inputs.ref }}
+        INPUT_WAIT_INTERVAL: ${{ inputs.wait_interval }}
+        INPUT_PROPAGATE_FAILURE: ${{ inputs.propagate_failure }}
+        INPUT_TRIGGER_WORKFLOW: ${{ inputs.trigger_workflow }}
+        INPUT_WAIT_WORKFLOW: ${{ inputs.wait_workflow }}
+        INPUT_GITHUB_USER: ${{ inputs.github_user }}
+        INPUT_COMMENT_DOWNSTREAM_URL: ${{ inputs.comment_downstream_url }}
+        INPUT_COMMENT_GITHUB_TOKEN: ${{ inputs.comment_github_token }}
+      run: |
+        ${{ github.action_path }}/entrypoint.sh
