@@ -11,7 +11,6 @@ usage_docs() {
   echo "    github_token: \${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}"
   echo "    workflow_file_name: main.yaml"
 }
-GITHUB_API_URL="${API_URL:-https://api.github.com}"
 GITHUB_SERVER_URL="${SERVER_URL:-https://github.com}"
 NOT_FOUND_RETRIES=0
 
@@ -90,33 +89,32 @@ lets_wait() {
 }
 
 api() {
-  path=$1; shift
-  local curl_exit_code
-  if response=$(curl --fail-with-body -sSL \
-      "${GITHUB_API_URL}/repos/${INPUT_OWNER}/${INPUT_REPO}/actions/$path" \
-      -H "Authorization: Bearer ${INPUT_GITHUB_TOKEN}" \
-      -H 'Accept: application/vnd.github.v3+json' \
-      -H 'Content-Type: application/json' \
-      "$@")
+  local path=$1; shift
+  local result
+  if result=$(gh api \
+    "repos/${INPUT_OWNER}/${INPUT_REPO}/actions/${path}" \
+    -H 'Accept: application/vnd.github.v3+json' \
+    "$@" 2>&1)
   then
-    echo "$response"
+    echo "$result"
   else
-    curl_exit_code=$?
     echo >&2 "api failed:"
     echo >&2 "path: $path"
-    echo >&2 "response: $response"
-    # Retry on transient curl errors (DNS, connection, timeout)
-    # 6=DNS, 7=connection refused, 28=timeout, 35=SSL connect, 56=recv error
-    if [[ $curl_exit_code -eq 6 || $curl_exit_code -eq 7 || $curl_exit_code -eq 28 || $curl_exit_code -eq 35 || $curl_exit_code -eq 56 ]]; then
+    echo >&2 "response: $result"
+    # gh api does not retry on transient network errors, so we handle them here
+    # by returning an empty JSON object and letting the caller's polling loop retry.
+    # gh formats DNS errors specially ("error connecting to <host>"), all other
+    # network errors use Go's url.Error format ('<Method> "<URL>": <inner error>').
+    if echo "$result" | grep -qiE "error connecting to|connection refused|connection timed out|operation timed out|context deadline exceeded|i/o timeout|TLS handshake timeout|connection reset by peer|broken pipe"; then
       echo "{}"
-      echo >&2 "Transient network error (curl exit code $curl_exit_code) - trying again"
-    elif [[ "$response" == *'"Server Error"'* ]]; then
+      echo >&2 "Transient network error - trying again"
+    elif [ $NOT_FOUND_RETRIES -lt 3 ] && echo "$result" | grep -q "Not Found"; then
       echo "{}"
-      echo >&2 "Server error - trying again"
-    elif [ $NOT_FOUND_RETRIES -lt 3 ] && [[ "$response" == *'"Not Found"'* ]]; then
-      echo "$response"
       NOT_FOUND_RETRIES=$((NOT_FOUND_RETRIES + 1))
       echo >&2 "Not found (attempt $NOT_FOUND_RETRIES) - trying again"
+    elif echo "$result" | grep -q "Server Error"; then
+      echo "{}"
+      echo >&2 "Server error - trying again"
     else
       exit 1
     fi
@@ -148,7 +146,11 @@ trigger_workflow() {
   echo >&2 "  {\"ref\":\"${ref}\",\"inputs\":${client_payload}}"
 
   dispatch_response=$(api "workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches" \
-    --data "{\"ref\":\"${ref}\",\"inputs\":${client_payload}}")
+    --method POST \
+    --input - <<EOF
+{"ref":"${ref}","inputs":${client_payload}}
+EOF
+  )
 
   # Check if the response contains workflow_run_id (new GitHub API behavior)
   workflow_run_id=$(echo "$dispatch_response" | jq -r '.workflow_run_id // empty')
@@ -173,16 +175,11 @@ trigger_workflow() {
 }
 
 comment_downstream_link() {
-  if response=$(curl --fail-with-body -sSL -X POST \
-      "${INPUT_COMMENT_DOWNSTREAM_URL}" \
-      -H "Authorization: Bearer ${INPUT_COMMENT_GITHUB_TOKEN}" \
-      -H 'Accept: application/vnd.github.v3+json' \
-      -d "{\"body\": \"Running downstream job at $1\"}")
-  then
-    echo "$response"
-  else
+  gh api "${INPUT_COMMENT_DOWNSTREAM_URL}" \
+    --method POST \
+    -H "Authorization: Bearer ${INPUT_COMMENT_GITHUB_TOKEN}" \
+    -f body="Running downstream job at $1" || \
     echo >&2 "failed to comment to ${INPUT_COMMENT_DOWNSTREAM_URL}:"
-  fi
 }
 
 wait_for_workflow_to_finish() {
