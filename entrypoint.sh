@@ -13,6 +13,7 @@ usage_docs() {
 }
 GITHUB_SERVER_URL="${SERVER_URL:-https://github.com}"
 NOT_FOUND_RETRIES=0
+RUN_IDS=
 
 validate_args() {
   wait_interval=10 # Waits for 10 seconds
@@ -121,6 +122,52 @@ api() {
   fi
 }
 
+# Dispatch the workflow, retrying on server (5xx) errors. Unlike api(), a failed
+# dispatch means no run was created, so we must never fall back to polling on
+# error - we retry a bounded number of times and then abort the whole action.
+# Prints nothing on success; returns non-zero if all attempts fail.
+dispatch_workflow() {
+  local attempt=1
+  local max_attempts=3
+  local result
+
+  while [ "$attempt" -le "$max_attempts" ]
+  do
+    if result=$(gh api \
+      "repos/${INPUT_OWNER}/${INPUT_REPO}/actions/workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches" \
+      -H 'Accept: application/vnd.github.v3+json' \
+      --method POST \
+      --input - <<EOF 2>&1
+{"ref":"${ref}","inputs":${client_payload}}
+EOF
+    )
+    then
+      # A successful workflow_dispatch returns HTTP 204 with an empty body.
+      echo "$result"
+      return 0
+    fi
+
+    echo >&2 "dispatch failed (attempt ${attempt}/${max_attempts}):"
+    echo >&2 "response: $result"
+
+    # Retry only on server/5xx errors (e.g. "Failed to run workflow dispatch"
+    # with HTTP 500). Client errors (bad ref, auth, missing workflow) are fatal.
+    if echo "$result" | grep -qiE "Server Error|HTTP 5[0-9][0-9]|\"status\": ?\"5[0-9][0-9]\""; then
+      if [ "$attempt" -lt "$max_attempts" ]; then
+        echo >&2 "Server error dispatching workflow - trying again"
+        lets_wait
+      fi
+      attempt=$((attempt + 1))
+    else
+      echo >&2 "Non-retryable error dispatching workflow - aborting"
+      return 1
+    fi
+  done
+
+  echo >&2 "Failed to dispatch workflow after ${max_attempts} attempts - aborting"
+  return 1
+}
+
 
 # Return the ids of the most recent workflow runs, optionally filtered by user
 get_workflow_runs() {
@@ -135,6 +182,9 @@ get_workflow_runs() {
   sort # Sort to ensure repeatable order, and lexicographically for compatibility with join
 }
 
+# Trigger the workflow and set the global RUN_IDS to the ids of the run(s) to
+# wait for. Runs as a plain statement (not inside $(...)) so that a failed
+# dispatch can abort the whole action via exit 1.
 trigger_workflow() {
   START_TIME=$(date +%s)
   SINCE=$(date -u -Iseconds -d "@$((START_TIME - 120))") # Two minutes ago, to overcome clock skew
@@ -145,23 +195,23 @@ trigger_workflow() {
   echo >&2 "  workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches"
   echo >&2 "  {\"ref\":\"${ref}\",\"inputs\":${client_payload}}"
 
-  dispatch_response=$(api "workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches" \
-    --method POST \
-    --input - <<EOF
-{"ref":"${ref}","inputs":${client_payload}}
-EOF
-  )
+  if ! dispatch_response=$(dispatch_workflow); then
+    echo >&2 "Error: failed to dispatch workflow; no run was created."
+    exit 1
+  fi
 
   # Check if the response contains workflow_run_id (new GitHub API behavior)
-  workflow_run_id=$(echo "$dispatch_response" | jq -r '.workflow_run_id // empty')
+  workflow_run_id=$(echo "$dispatch_response" | jq -r '.workflow_run_id // empty' 2>/dev/null)
 
   if [ -n "$workflow_run_id" ]; then
     echo >&2 "Workflow run ID returned directly: $workflow_run_id"
-    echo "$workflow_run_id"
+    RUN_IDS="$workflow_run_id"
     return
   fi
 
-  # Fall back to polling approach (old behavior)
+  # Dispatch succeeded (HTTP 204, empty body) but did not return a run id, so
+  # fall back to polling for the newly created run. This is only reached on a
+  # successful dispatch - errored dispatches abort above.
   echo >&2 "No workflow_run_id in response, falling back to polling"
   NEW_RUNS=$OLD_RUNS
   while [ "$NEW_RUNS" = "$OLD_RUNS" ]
@@ -170,8 +220,8 @@ EOF
     NEW_RUNS=$(get_workflow_runs "$SINCE")
   done
 
-  # Return new run ids
-  join -v2 <(echo "$OLD_RUNS") <(echo "$NEW_RUNS")
+  # New run ids
+  RUN_IDS=$(join -v2 <(echo "$OLD_RUNS") <(echo "$NEW_RUNS"))
 }
 
 comment_downstream_link() {
@@ -233,14 +283,14 @@ main() {
 
   if [ "${trigger_workflow}" = true ]
   then
-    run_ids=$(trigger_workflow)
+    trigger_workflow
   else
     echo "Skipping triggering the workflow."
   fi
 
   if [ "${wait_workflow}" = true ]
   then
-    for run_id in $run_ids
+    for run_id in $RUN_IDS
     do
       wait_for_workflow_to_finish "$run_id"
     done

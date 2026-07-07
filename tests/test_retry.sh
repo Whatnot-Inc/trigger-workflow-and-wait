@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit tests for api() retry behavior in entrypoint.sh
+# Unit tests for api()/dispatch retry behavior in entrypoint.sh
 set +e
 
 TESTS_PASSED=0
@@ -20,21 +20,25 @@ set +e  # Re-disable set -e (entrypoint.sh enables it)
 # Use short wait interval for fast tests
 wait_interval=0
 propagate_failure=true
+ref="main"
+client_payload="{}"
 
-# Helper: set up a mock curl using a file-based call counter (needed because
-# api() invokes curl inside a command substitution / subshell)
-setup_mock_curl() {
+# Helper: set up a mock `gh` using a file-based call counter (needed because
+# api() invokes gh inside a command substitution / subshell). The code under
+# test calls `gh api <path> ...`, so the mock ignores the leading `api` arg.
+setup_mock_gh() {
   local fail_count=$1
   local fail_exit_code=$2
   local fail_response=$3
+  local success_response=${4:-'{"conclusion": "success", "status": "completed"}'}
 
   CALL_COUNT_FILE=$(mktemp)
   echo 0 > "$CALL_COUNT_FILE"
 
-  # Export vars so the function can access them in subshells
-  export CALL_COUNT_FILE FAIL_COUNT="$fail_count" FAIL_EXIT_CODE="$fail_exit_code" FAIL_RESPONSE="$fail_response"
+  export CALL_COUNT_FILE FAIL_COUNT="$fail_count" FAIL_EXIT_CODE="$fail_exit_code" \
+    FAIL_RESPONSE="$fail_response" SUCCESS_RESPONSE="$success_response"
 
-  curl() {
+  gh() {
     local count=$(($(cat "$CALL_COUNT_FILE") + 1))
     echo $count > "$CALL_COUNT_FILE"
     if [ $count -le $FAIL_COUNT ]; then
@@ -43,10 +47,12 @@ setup_mock_curl() {
       fi
       return "$FAIL_EXIT_CODE"
     fi
-    echo '{"conclusion": "success", "status": "completed"}'
+    if [ -n "$SUCCESS_RESPONSE" ]; then
+      echo "$SUCCESS_RESPONSE"
+    fi
     return 0
   }
-  export -f curl
+  export -f gh
 }
 
 get_call_count() {
@@ -55,8 +61,10 @@ get_call_count() {
 
 cleanup_mock() {
   rm -f "$CALL_COUNT_FILE"
-  # Reset NOT_FOUND_RETRIES between tests
+  # Reset state between tests
   NOT_FOUND_RETRIES=0
+  RUN_IDS=
+  unset -f gh
 }
 
 assert_result() {
@@ -79,7 +87,7 @@ assert_result() {
 
 # Run wait_for_workflow_to_finish in a subshell so that exit 1 from
 # non-retryable errors doesn't kill the test harness.
-run_test() {
+run_wait_test() {
   local name=$1
   local expected_exit=$2
   local expected_calls=$3
@@ -98,36 +106,70 @@ run_test() {
   rm -f "$output_file"
 }
 
-# Transient network errors: fail twice then succeed
-setup_mock_curl 2 6 ""
-run_test "DNS resolution failure (exit 6) retries" 0 3
+# Run dispatch_workflow in a subshell and assert on exit status + call count.
+run_dispatch_test() {
+  local name=$1
+  local expected_exit=$2
+  local expected_calls=$3
 
-setup_mock_curl 2 7 ""
-run_test "Connection refused (exit 7) retries" 0 3
+  local output_file=$(mktemp)
 
-setup_mock_curl 2 28 ""
-run_test "Timeout (exit 28) retries" 0 3
+  (dispatch_workflow) > "$output_file" 2>&1
+  local actual_exit=$?
+  local actual_calls=$(get_call_count)
+  cleanup_mock
 
-setup_mock_curl 2 35 ""
-run_test "SSL connect error (exit 35) retries" 0 3
+  if ! assert_result "$name" "$expected_exit" "$expected_calls" "$actual_exit" "$actual_calls"; then
+    cat "$output_file"
+  fi
+  rm -f "$output_file"
+}
 
-setup_mock_curl 2 56 ""
-run_test "Recv failure (exit 56) retries" 0 3
+# --- wait_for_workflow_to_finish: api() retry behavior ---
 
-# HTTP errors: --fail-with-body makes curl exit 22, response body is available
-setup_mock_curl 2 22 '{"message": "Server Error"}'
-run_test "Server error retries" 0 3
+# Transient network errors: fail twice then succeed. api() classifies these by
+# matching gh's textual error output, so the mock emits representative messages.
+setup_mock_gh 2 1 'error connecting to api.github.com'
+run_wait_test "DNS resolution failure retries" 0 3
 
-setup_mock_curl 2 22 '{"message": "Not Found"}'
-run_test "Not found retries" 0 3
+setup_mock_gh 2 1 'Post "https://api.github.com/...": dial tcp: connection refused'
+run_wait_test "Connection refused retries" 0 3
+
+setup_mock_gh 2 1 'Get "https://api.github.com/...": context deadline exceeded'
+run_wait_test "Timeout retries" 0 3
+
+# HTTP errors surfaced by gh
+setup_mock_gh 2 1 'gh: Server Error (HTTP 500)'
+run_wait_test "Server error retries" 0 3
+
+setup_mock_gh 2 1 'gh: Not Found (HTTP 404)'
+run_wait_test "Not found retries" 0 3
 
 # Happy path
-setup_mock_curl 0 0 ""
-run_test "Immediate success" 0 1
+setup_mock_gh 0 0 ""
+run_wait_test "Immediate success" 0 1
 
 # Non-retryable errors exit immediately
-setup_mock_curl 100 22 '{"message": "Bad credentials"}'
-run_test "Non-retryable error (403) exits" 1 1
+setup_mock_gh 100 1 'gh: Bad credentials (HTTP 401)'
+run_wait_test "Non-retryable error (401) exits" 1 1
+
+# --- dispatch_workflow: dispatch retry/fail behavior ---
+
+# Successful dispatch (HTTP 204, empty body) on first try
+setup_mock_gh 0 0 "" ""
+run_dispatch_test "Dispatch success (204) does not retry" 0 1
+
+# Server error every time: retries up to max_attempts (3) then fails
+setup_mock_gh 100 1 'gh: Failed to run workflow dispatch (HTTP 500)' ""
+run_dispatch_test "Dispatch 500 retries then fails" 1 3
+
+# Server error twice then success: proceeds
+setup_mock_gh 2 1 'gh: Failed to run workflow dispatch (HTTP 500)' ""
+run_dispatch_test "Dispatch 500 twice then succeeds" 0 3
+
+# Non-retryable dispatch error (e.g. bad ref / 422) fails immediately
+setup_mock_gh 100 1 'gh: Reference does not exist (HTTP 422)' ""
+run_dispatch_test "Dispatch non-retryable error fails immediately" 1 1
 
 # Cleanup
 rm -f "$GITHUB_OUTPUT"
