@@ -13,6 +13,7 @@ usage_docs() {
 }
 GITHUB_SERVER_URL="${SERVER_URL:-https://github.com}"
 NOT_FOUND_RETRIES=0
+RUN_IDS=
 
 validate_args() {
   wait_interval=10 # Waits for 10 seconds
@@ -121,6 +122,54 @@ api() {
   fi
 }
 
+# Perform a single workflow_dispatch POST and classify the outcome. Because
+# workflow_dispatch is NOT idempotent, we must never blindly re-dispatch on
+# error: a 5xx (or network error) can occur AFTER the run was created, so a
+# retry would start a second run. Callers use the classification to decide
+# whether to poll for a run that may have been created despite the error.
+#
+# Sets two globals (rather than using command substitution, so the outcome
+# survives in the caller's shell):
+#   DISPATCH_RESPONSE - the response body (empty on the usual HTTP 204 success)
+#   DISPATCH_OUTCOME  - exactly one classification token:
+#     success   - dispatch accepted (HTTP 204 or a workflow_run_id returned)
+#     ambiguous - 5xx server error or network error; outcome unknown, may have
+#                 created a run
+#     fatal     - non-retryable client error (bad ref, auth, missing workflow);
+#                 no run was created
+DISPATCH_OUTCOME=
+DISPATCH_RESPONSE=
+dispatch_workflow() {
+  if DISPATCH_RESPONSE=$(gh api \
+    "repos/${INPUT_OWNER}/${INPUT_REPO}/actions/workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches" \
+    -H 'Accept: application/vnd.github.v3+json' \
+    --method POST \
+    --input - <<EOF 2>&1
+{"ref":"${ref}","inputs":${client_payload}}
+EOF
+  )
+  then
+    # A successful workflow_dispatch returns HTTP 204 with an empty body.
+    DISPATCH_OUTCOME=success
+    return 0
+  fi
+
+  echo >&2 "dispatch failed:"
+  echo >&2 "response: $DISPATCH_RESPONSE"
+
+  # Ambiguous outcomes (may have created a run despite the error):
+  #  - Server/5xx errors (e.g. "Failed to run workflow dispatch", HTTP 500)
+  #  - Network errors where gh never received a response (DNS/connection/timeout)
+  if echo "$DISPATCH_RESPONSE" | grep -qiE "Server Error|HTTP 5[0-9][0-9]|\"status\": ?\"5[0-9][0-9]\"|error connecting to|connection refused|connection timed out|operation timed out|context deadline exceeded|i/o timeout|TLS handshake timeout|connection reset by peer|broken pipe"; then
+    echo >&2 "Ambiguous dispatch error - outcome unknown, will poll for a run"
+    DISPATCH_OUTCOME=ambiguous
+  else
+    echo >&2 "Non-retryable error dispatching workflow"
+    DISPATCH_OUTCOME=fatal
+  fi
+  return 1
+}
+
 
 # Return the ids of the most recent workflow runs, optionally filtered by user
 get_workflow_runs() {
@@ -135,43 +184,95 @@ get_workflow_runs() {
   sort # Sort to ensure repeatable order, and lexicographically for compatibility with join
 }
 
+# Poll for run ids created since the dispatch (i.e. not in OLD_RUNS), for up to
+# `attempts` intervals. Sets RUN_IDS and returns 0 as soon as any new run is
+# found; returns 1 if none appear within the window.
+poll_for_new_run() {
+  local attempts=$1
+  local new_runs found
+  local i=0
+  while [ "$i" -lt "$attempts" ]
+  do
+    lets_wait
+    new_runs=$(get_workflow_runs "$SINCE")
+    found=$(join -v2 <(echo "$OLD_RUNS") <(echo "$new_runs"))
+    if [ -n "$found" ]; then
+      RUN_IDS="$found"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Trigger the workflow and set the global RUN_IDS to the ids of the run(s) to
+# wait for. Runs as a plain statement (not inside $(...)) so that a failed
+# dispatch can abort the whole action via exit 1.
+#
+# workflow_dispatch is not idempotent, so on an ambiguous error (5xx/network) we
+# never blindly re-dispatch: we first poll to see whether a run was created
+# despite the error, and only re-dispatch (at most once) if none appeared.
 trigger_workflow() {
   START_TIME=$(date +%s)
   SINCE=$(date -u -Iseconds -d "@$((START_TIME - 120))") # Two minutes ago, to overcome clock skew
 
   OLD_RUNS=$(get_workflow_runs "$SINCE")
 
-  echo >&2 "Triggering workflow:"
-  echo >&2 "  workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches"
-  echo >&2 "  {\"ref\":\"${ref}\",\"inputs\":${client_payload}}"
-
-  dispatch_response=$(api "workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches" \
-    --method POST \
-    --input - <<EOF
-{"ref":"${ref}","inputs":${client_payload}}
-EOF
-  )
-
-  # Check if the response contains workflow_run_id (new GitHub API behavior)
-  workflow_run_id=$(echo "$dispatch_response" | jq -r '.workflow_run_id // empty')
-
-  if [ -n "$workflow_run_id" ]; then
-    echo >&2 "Workflow run ID returned directly: $workflow_run_id"
-    echo "$workflow_run_id"
-    return
-  fi
-
-  # Fall back to polling approach (old behavior)
-  echo >&2 "No workflow_run_id in response, falling back to polling"
-  NEW_RUNS=$OLD_RUNS
-  while [ "$NEW_RUNS" = "$OLD_RUNS" ]
+  local redispatched=false
+  while true
   do
-    lets_wait
-    NEW_RUNS=$(get_workflow_runs "$SINCE")
-  done
+    echo >&2 "Triggering workflow:"
+    echo >&2 "  workflows/${INPUT_WORKFLOW_FILE_NAME}/dispatches"
+    echo >&2 "  {\"ref\":\"${ref}\",\"inputs\":${client_payload}}"
 
-  # Return new run ids
-  join -v2 <(echo "$OLD_RUNS") <(echo "$NEW_RUNS")
+    dispatch_workflow || true
+
+    case "$DISPATCH_OUTCOME" in
+      success)
+        # A workflow_run_id may be returned directly (newer GitHub behavior).
+        workflow_run_id=$(echo "$DISPATCH_RESPONSE" | jq -r '.workflow_run_id // empty' 2>/dev/null)
+        if [ -n "$workflow_run_id" ]; then
+          echo >&2 "Workflow run ID returned directly: $workflow_run_id"
+          RUN_IDS="$workflow_run_id"
+          return
+        fi
+        # HTTP 204 with empty body: the dispatch was accepted, so poll
+        # indefinitely for the newly created run (never re-dispatch).
+        echo >&2 "No workflow_run_id in response, polling for the new run"
+        local new_runs
+        RUN_IDS=
+        while [ -z "$RUN_IDS" ]
+        do
+          lets_wait
+          new_runs=$(get_workflow_runs "$SINCE")
+          RUN_IDS=$(join -v2 <(echo "$OLD_RUNS") <(echo "$new_runs"))
+        done
+        return
+        ;;
+
+      ambiguous)
+        # The dispatch may or may not have created a run. Poll a bounded window
+        # before deciding whether to re-dispatch, to avoid double-dispatching.
+        echo >&2 "Polling for a run that may have been created despite the error"
+        if poll_for_new_run 3; then
+          echo >&2 "A run appeared despite the dispatch error; waiting on it"
+          return
+        fi
+        if [ "$redispatched" = true ]; then
+          echo >&2 "Error: no run appeared and dispatch was already retried once; aborting."
+          exit 1
+        fi
+        echo >&2 "No run appeared; re-dispatching once"
+        redispatched=true
+        continue
+        ;;
+
+      *)
+        echo >&2 "Error: failed to dispatch workflow; no run was created."
+        exit 1
+        ;;
+    esac
+  done
 }
 
 comment_downstream_link() {
@@ -233,14 +334,14 @@ main() {
 
   if [ "${trigger_workflow}" = true ]
   then
-    run_ids=$(trigger_workflow)
+    trigger_workflow
   else
     echo "Skipping triggering the workflow."
   fi
 
   if [ "${wait_workflow}" = true ]
   then
-    for run_id in $run_ids
+    for run_id in $RUN_IDS
     do
       wait_for_workflow_to_finish "$run_id"
     done
