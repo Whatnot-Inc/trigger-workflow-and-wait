@@ -134,7 +134,7 @@ run_dispatch_test() {
 # Distinguishes dispatch POSTs (path contains "/dispatches") from run-list
 # queries (path contains "/runs?"). Driven by env:
 #   DISPATCH_SCRIPT : space-separated outcomes per dispatch attempt, each one of
-#                     ok|500|net|422 (ok = HTTP 204 success).
+#                     ok|500|net|422|empty (ok = HTTP 204 success).
 #   RUNS_APPEAR_ON  : the get_workflow_runs call index (1-based) at/after which a
 #                     NEW run id appears. 0 = never appears.
 # A separate counter tracks run-list calls so RUNS_APPEAR_ON is deterministic.
@@ -168,6 +168,7 @@ setup_mock_orchestration() {
         500) echo 'gh: Failed to run workflow dispatch (HTTP 500)'; return 1 ;;
         net) echo 'Post "https://api.github.com/...": dial tcp: connection refused'; return 1 ;;
         422) echo 'gh: Reference does not exist (HTTP 422)'; return 1 ;;
+        empty) echo 'unexpected end of JSON input'; return 1 ;;
       esac
       return 1
     fi
@@ -267,6 +268,13 @@ run_dispatch_test "Dispatch network error -> ambiguous" ambiguous
 setup_mock_gh 1 1 'gh: Reference does not exist (HTTP 422)' ""
 run_dispatch_test "Dispatch 422 -> fatal" fatal
 
+# Empty or cut-off response body -> ambiguous (the POST may have been accepted)
+setup_mock_gh 1 1 'unexpected end of JSON input' ""
+run_dispatch_test "Dispatch empty body -> ambiguous" ambiguous
+
+setup_mock_gh 1 1 'gh: unexpected EOF' ""
+run_dispatch_test "Dispatch unexpected EOF -> ambiguous" ambiguous
+
 # --- trigger_workflow: poll-first / re-dispatch-once orchestration ---
 
 # 204 success, new run surfaces on first poll -> wait on it, 1 dispatch.
@@ -292,6 +300,14 @@ run_trigger_test "Ambiguous then re-dispatch succeeds" 0 999 2
 # 4xx fatal -> abort immediately, 1 dispatch, no run
 setup_mock_orchestration "422" 0
 run_trigger_test "Fatal dispatch aborts immediately" 1 "" 1
+
+# Empty body but the run was created -> wait on it WITHOUT re-dispatching
+setup_mock_orchestration "empty" 2
+run_trigger_test "Empty body but run appeared -> no re-dispatch" 0 999 1
+
+# Empty body, no run -> re-dispatch once, which succeeds -> 2 dispatches
+setup_mock_orchestration "empty ok" 5
+run_trigger_test "Empty body, no run, re-dispatch succeeds" 0 999 2
 
 # Cleanup
 rm -f "$GITHUB_OUTPUT"

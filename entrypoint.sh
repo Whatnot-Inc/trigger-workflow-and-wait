@@ -160,7 +160,8 @@ EOF
   # Ambiguous outcomes (may have created a run despite the error):
   #  - Server/5xx errors (e.g. "Failed to run workflow dispatch", HTTP 500)
   #  - Network errors where gh never received a response (DNS/connection/timeout)
-  if echo "$DISPATCH_RESPONSE" | grep -qiE "Server Error|HTTP 5[0-9][0-9]|\"status\": ?\"5[0-9][0-9]\"|error connecting to|connection refused|connection timed out|operation timed out|context deadline exceeded|i/o timeout|TLS handshake timeout|connection reset by peer|broken pipe"; then
+  #  - Empty or cut-off response bodies ("unexpected end of JSON input", "unexpected EOF")
+  if echo "$DISPATCH_RESPONSE" | grep -qiE "Server Error|HTTP 5[0-9][0-9]|\"status\": ?\"5[0-9][0-9]\"|error connecting to|connection refused|connection timed out|operation timed out|context deadline exceeded|i/o timeout|TLS handshake timeout|connection reset by peer|broken pipe|unexpected end of JSON input|unexpected EOF"; then
     echo >&2 "Ambiguous dispatch error - outcome unknown, will poll for a run"
     DISPATCH_OUTCOME=ambiguous
   else
